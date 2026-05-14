@@ -141,7 +141,7 @@ function renderPilotList() {
       '<div class="pilot-item-name">' + esc(p.name) + '</div>' +
       '<div class="pilot-item-meta">' +
         '<span class="tag-air">✈ ' + esc(p.totalStats.airTimeHM) + '</span>' +
-        '<span class="tag-flights">' + p.totalStats.flights + ' vol' + (p.totalStats.flights > 1 ? 's' : '') + '</span>' +
+        '<span class="tag-flights">' + p.totalStats.flights + ' flight' + (p.totalStats.flights > 1 ? 's' : '') + '</span>' +
         '<span class="tag-alt">↑ ' + p.totalStats.dPlusHike + 'm</span>' +
       '</div>';
     if (p.civlId === state.selectedCivlId) el.classList.add('active');
@@ -642,40 +642,54 @@ function setupChartInteraction(canvas, track, segments, passages) {
 }
 
 // ── Race summary ──────────────────────────────────────────────────────────────
+let raceSummaryVisible = false;
+let _konamiBuffer = '';
+document.addEventListener('keydown', function(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  _konamiBuffer = (_konamiBuffer + e.key).slice(-4);
+  if (_konamiBuffer === 'toto') {
+    raceSummaryVisible = !raceSummaryVisible;
+    if (state.overviewMode) showOverview();
+  }
+});
+
 function buildRaceSummaryHtml(pilots) {
   const n = pilots.length;
   if (!n) return '';
-  let airTimeSec = 0, flights = 0, distFlyingKm = 0, maxAlt = 0, bestVario = 0, distHikingKm = 0, dPlusHike = 0;
+  let airTimeSec = 0, hikeTimeSec = 0, flights = 0, distFlyingKm = 0, maxAlt = 0, distHikingKm = 0, dPlusHike = 0;
   for (const p of pilots) {
     const s = p.totalStats;
     airTimeSec   += s.airTimeSec;
+    hikeTimeSec  += s.hikeTimeSec;
     flights      += s.flights;
     distFlyingKm += s.distFlyingKm;
     distHikingKm += s.distHikingKm;
     dPlusHike    += s.dPlusHike;
-    if (s.maxAlt    > maxAlt)    maxAlt    = s.maxAlt;
-    if (s.bestVario > bestVario) bestVario = s.bestVario;
+    if (s.maxAlt > maxAlt) maxAlt = s.maxAlt;
   }
   const r1   = v => Math.round(v * 10) / 10;
   const hm   = s => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); return h + 'h' + String(m).padStart(2, '0'); };
   const card = (cls, val, lbl) => '<div class="stat-card ' + cls + '"><div class="stat-value">' + val + '</div><div class="stat-label">' + lbl + '</div></div>';
   return '<div class="race-summary">' +
     '<div class="section-title">Race summary — ' + n + ' pilot' + (n > 1 ? 's' : '') + '</div>' +
-    '<div class="summary-group-label">Totals</div>' +
-    '<div class="cards">' +
-      card('fly',   hm(airTimeSec),                                     'Air time') +
-      card('fly',   flights + ' flight' + (flights !== 1 ? 's' : ''),  'Flights') +
-      card('fly',   r1(distFlyingKm) + ' km',                          'Flight dist.') +
-      card('peak',  maxAlt + ' m',                                       'Best altitude') +
-      card('vario', '+' + bestVario + ' m/s',                          'Best vario') +
-      card('hike',  r1(distHikingKm) + ' km',                         'Hike dist.') +
-      card('hike',  '+' + dPlusHike + ' m',                           'D+ on foot') +
+    '<div' + (raceSummaryVisible ? '' : ' style="display:none"') + '>' +
+      '<div class="summary-group-label">Totals</div>' +
+      '<div class="cards">' +
+        card('fly',   hm(airTimeSec),                                     'Air time') +
+        card('fly',   flights + ' flight' + (flights !== 1 ? 's' : ''),  'Flights') +
+        card('fly',   r1(distFlyingKm) + ' km',                          'Flight dist.') +
+        card('peak',  maxAlt + ' m',                                       'Best altitude') +
+        card('hike',  hm(hikeTimeSec),                                    'Hike time') +
+        card('hike',  r1(distHikingKm) + ' km',                         'Hike dist.') +
+        card('hike',  '+' + dPlusHike + ' m',                           'D+ on foot') +
+      '</div>' +
     '</div>' +
     '<div class="summary-group-label">Averages per pilot</div>' +
     '<div class="cards">' +
       card('fly',   hm(Math.round(airTimeSec / n)),                    'Avg air time') +
       card('fly',   r1(flights / n) + ' flights',                      'Avg flights') +
       card('fly',   r1(distFlyingKm / n) + ' km',                     'Avg flight dist.') +
+      card('hike',  hm(Math.round(hikeTimeSec / n)),                   'Avg hike time') +
       card('hike',  r1(distHikingKm / n) + ' km',                    'Avg hike dist.') +
       card('hike',  '+' + Math.round(dPlusHike / n) + ' m',          'Avg D+') +
     '</div>' +
