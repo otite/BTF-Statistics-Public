@@ -28,7 +28,7 @@
 <script>
 'use strict';
 
-const UTC_OFFSET_S = 2 * 3600;
+let UTC_OFFSET_S = 2 * 3600;
 
 // PILOTS is defined before this script in the HTML
 
@@ -125,7 +125,7 @@ function esc(s) {
 function formatDate(dateStr) {
   const y = dateStr.substring(0, 4), m = dateStr.substring(4, 6), d = dateStr.substring(6, 8);
   const date = new Date(y + '-' + m + '-' + d);
-  return date.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  return date.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 }
 
 // ── Pilot list ────────────────────────────────────────────────────────────────
@@ -860,6 +860,7 @@ window.addEventListener('resize', function() {
   state.taskTurnpoints = meta.taskTurnpoints || null;
   state.dayWindows = meta.dayWindows || {};
   state.tieWindowS = meta.tieWindowS ?? 10;
+  UTC_OFFSET_S = (meta.utcOffsetH ?? 2) * 3600;
   renderPilotList();
   showOverview();
 })();
