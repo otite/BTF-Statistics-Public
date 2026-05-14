@@ -544,6 +544,96 @@ function setupChartInteraction(canvas, track, segments, passages) {
     redraw();
   });
 
+  // ── Touch support ──────────────────────────────────────────────────────────
+  var touch = null;
+
+  function showTooltipForTouch(clientX, clientY, hoverTime) {
+    if (!tooltip) return;
+    var closest = null, minDiff = Infinity;
+    for (var i = 0; i < track.length; i++) {
+      var diff = Math.abs(track[i].t - hoverTime);
+      if (diff < minDiff) { minDiff = diff; closest = track[i]; }
+    }
+    if (!closest) return;
+    var _t = (closest.t + UTC_OFFSET_S) % 86400;
+    var hh = Math.floor(_t / 3600), mm = Math.floor((_t % 3600) / 60), ss = Math.floor(_t % 60);
+    tooltip.innerHTML =
+      String(hh).padStart(2,'0') + ':' + String(mm).padStart(2,'0') + ':' + String(ss).padStart(2,'0') +
+      '<br>Speed: ' + (closest.speed ? Math.round(closest.speed * 10) / 10 + ' km/h' : 'N/A') +
+      '<br>AGL: '   + (closest.agl !== null ? Math.round(closest.agl) + ' m' : 'N/A') +
+      '<br>ALT: '   + (closest.alt !== null ? Math.round(closest.alt) + ' m' : 'N/A');
+    tooltip.style.left    = Math.min(clientX + 12, window.innerWidth - 150) + 'px';
+    tooltip.style.top     = Math.max(clientY - 80, 60) + 'px';
+    tooltip.style.display = 'block';
+  }
+
+  canvas.addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    var z = chartZoom.get(canvas);
+    var rect = canvas.getBoundingClientRect();
+    if (e.touches.length === 1) {
+      var t0 = e.touches[0];
+      touch = { type: 'drag', startX: t0.clientX, tMinView: z.tMinView, tMaxView: z.tMaxView };
+    } else if (e.touches.length === 2) {
+      var dist = Math.abs(e.touches[0].clientX - e.touches[1].clientX);
+      var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      touch = { type: 'pinch', dist: dist, midX: midX, tMinView: z.tMinView, tMaxView: z.tMaxView };
+      if (tooltip) tooltip.style.display = 'none';
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', function(e) {
+    e.preventDefault();
+    if (!touch) return;
+    var z = chartZoom.get(canvas);
+    var rect = canvas.getBoundingClientRect();
+    var cW = canvas.clientWidth - PAD_LEFT - PAD_RIGHT;
+
+    if (touch.type === 'drag' && e.touches.length === 1) {
+      var t = e.touches[0];
+      var range = touch.tMaxView - touch.tMinView;
+      var dt = -(t.clientX - touch.startX) / cW * range;
+      var newMin = touch.tMinView + dt;
+      var newMax = touch.tMaxView + dt;
+      if (newMin < z.tMinFull) { newMin = z.tMinFull; newMax = newMin + range; }
+      if (newMax > z.tMaxFull) { newMax = z.tMaxFull; newMin = newMax - range; }
+      chartZoom.set(canvas, Object.assign({}, z, { tMinView: newMin, tMaxView: newMax, hoverTime: null }));
+      redraw();
+      var x = t.clientX - rect.left;
+      if (x >= PAD_LEFT && x <= canvas.clientWidth - PAD_RIGHT) {
+        showTooltipForTouch(t.clientX, t.clientY, newMin + (x - PAD_LEFT) / cW * (newMax - newMin));
+      }
+    } else if (touch.type === 'pinch' && e.touches.length === 2) {
+      var newDist = Math.abs(e.touches[0].clientX - e.touches[1].clientX);
+      if (newDist < 1) return;
+      var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      var frac = Math.max(0, Math.min(1, (midX - PAD_LEFT) / cW));
+      var tCursor = touch.tMinView + frac * (touch.tMaxView - touch.tMinView);
+      var factor = touch.dist / newDist;
+      var newMin = tCursor - (tCursor - touch.tMinView) * factor;
+      var newMax = tCursor + (touch.tMaxView - tCursor) * factor;
+      newMin = Math.max(newMin, z.tMinFull);
+      newMax = Math.min(newMax, z.tMaxFull);
+      if (newMax - newMin < 60) return;
+      chartZoom.set(canvas, Object.assign({}, z, { tMinView: newMin, tMaxView: newMax, hoverTime: null }));
+      redraw();
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', function(e) {
+    e.preventDefault();
+    if (e.touches.length === 0) {
+      var z = chartZoom.get(canvas);
+      chartZoom.set(canvas, Object.assign({}, z, { hoverTime: null }));
+      if (tooltip) tooltip.style.display = 'none';
+      touch = null;
+      redraw();
+    } else if (e.touches.length === 1 && touch && touch.type === 'pinch') {
+      var z = chartZoom.get(canvas);
+      touch = { type: 'drag', startX: e.touches[0].clientX, tMinView: z.tMinView, tMaxView: z.tMaxView };
+    }
+  }, { passive: false });
+
   if (hint) hint.addEventListener('click', function() {
     const z = chartZoom.get(canvas);
     chartZoom.set(canvas, Object.assign({}, z, { tMinView: z.tMinFull, tMaxView: z.tMaxFull }));

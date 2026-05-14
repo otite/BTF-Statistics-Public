@@ -267,3 +267,41 @@ tr:hover td { background: #f8fafc; }
 }
 .cfg-day-row:last-child { border-bottom: none; }
 .cfg-day-label { font-size: 13px; font-weight: 500; color: var(--text); }
+
+/* ── Mobile ──────────────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  html, body { overflow: auto; }
+
+  #topbar {
+    height: auto; min-height: 48px;
+    flex-wrap: wrap; padding: 8px 12px; gap: 8px;
+  }
+  .app-title { font-size: 13px; }
+  .topbar-disclaimer { display: none; }
+
+  #layout {
+    flex-direction: column;
+    height: auto; overflow: visible;
+  }
+
+  #sidebar {
+    width: 100%; min-width: unset;
+    max-height: 32vh;
+    border-right: none; border-bottom: 1px solid #0f1924;
+  }
+
+  #content { overflow-y: visible; padding: 16px 12px; }
+
+  .cards { gap: 8px; }
+  .stat-card { min-width: 80px; padding: 10px 12px; }
+  .stat-value { font-size: 17px; }
+
+  canvas.alt-chart { height: 180px; touch-action: none; }
+
+  .phase-legend { flex-wrap: wrap; gap: 6px 12px; font-size: 11px; }
+
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { min-width: 480px; }
+
+  .pilot-header h2 { font-size: 18px; }
+}
