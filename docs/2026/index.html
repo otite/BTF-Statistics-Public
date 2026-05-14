@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bornes To Fly Statistics</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="topbar-left">
+    <span class="app-title">Bornes To Fly Statistics</span>
+    <button id="btn-overview" class="btn-secondary">Overview</button>
+    <button id="btn-classement" class="btn-secondary" style="display:none">Ranking</button>
+  </div>
+  <div id="folder-tags"></div>
+  <div class="topbar-disclaimer">Data source: Flymaster live tracking &nbsp;·&nbsp; All times UTC+2 &nbsp;·&nbsp; Data may be inaccurate — use at your own risk</div>
+</header>
+<div id="layout">
+  <aside id="sidebar">
+    <input id="search" type="text" placeholder="Search for a pilot…">
+    <div id="pilot-list"></div>
+  </aside>
+  <main id="content"></main>
+</div>
+<script src="data/meta.js"></script>
+<script src="data/pilots.js"></script>
+<script>
+'use strict';
+
+const UTC_OFFSET_S = 2 * 3600;
+
+// PILOTS is defined before this script in the HTML
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let state = {
+  pilots: [],
+  filteredPilots: [],
+  selectedCivlId: null,
+  overviewMode: false,
+  classementMode: false,
+  goalCoords: null,
+  taskTurnpoints: null,
+  dayWindows: {},
+  tieWindowS: 10,
+  sortCol: 'name',
+  sortAsc: true,
+};
+
+const chartZoom = new Map();
+const $ = id => document.getElementById(id);
+
+// ── Overview columns ──────────────────────────────────────────────────────────
+const OV_COLS = [
+  { key: 'rank',          label: '#',             cls: '' },
+  { key: 'name',          label: 'Pilot',        cls: '',        sort: 'name' },
+  { key: 'compId',        label: 'Bib',          cls: '' },
+  { key: 'airTimeHM',     label: 'Air time',     cls: 'td-fly',   sort: 'airTimeSec' },
+  { key: 'flights',       label: 'Flights',      cls: 'td-fly',   sort: 'flights' },
+  { key: 'distFlyingKm',  label: 'Flight dist.', cls: 'td-fly',   sort: 'distFlyingKm' },
+  { key: 'maxAlt',        label: 'Max alt.',     cls: 'td-alt',   sort: 'maxAlt' },
+  { key: 'bestVario',     label: 'Best vario',   cls: 'td-vario', sort: 'bestVario' },
+  { key: 'hikeTimeHM',    label: 'Hiking',       cls: 'td-hike',  sort: 'hikeTimeSec' },
+  { key: 'distHikingKm',  label: 'Hike dist.',   cls: 'td-hike',  sort: 'distHikingKm' },
+  { key: 'dPlusHike',     label: 'D+ on foot',   cls: 'td-hike',  sort: 'dPlusHike' },
+];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function round1(v) { return Math.round(v * 10) / 10; }
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  var R = 6371, dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
+  var a = Math.sin(dLat/2)*Math.sin(dLat/2) +
+    Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)*Math.sin(dLon/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function calcRaceDurationSec(pilot, rankPassage, rankDay, dayWindows) {
+  var getWin = function(dateStr) {
+    var w = (dayWindows || {})[dateStr] || { startHH: 0, startMM: 0, endHH: 23, endMM: 59 };
+    return { start: w.startHH * 3600 + w.startMM * 60, end: w.endHH * 3600 + w.endMM * 60 };
+  };
+
+  var raceDays = Object.keys(dayWindows || {}).sort();
+  var firstDayStr = raceDays[0] || (pilot.days[0] && pilot.days[0].dateStr);
+  if (!firstDayStr) return null;
+
+  var startSec = getWin(firstDayStr).start;
+  var essSec = rankPassage.timeSec;
+  var essDateStr = rankDay.dateStr;
+
+  if (firstDayStr === essDateStr) return Math.max(0, essSec - startSec);
+
+  var pilotDays = pilot.days.map(function(d) { return d.dateStr; });
+  var merged = raceDays.concat(pilotDays).filter(function(v, i, a) { return a.indexOf(v) === i; }).sort();
+  var startIdx = merged.indexOf(firstDayStr);
+  var essIdx = merged.indexOf(essDateStr);
+  if (startIdx === -1 || essIdx <= startIdx) return null;
+
+  var total = 0;
+  for (var i = startIdx; i <= essIdx; i++) {
+    var win = getWin(merged[i]);
+    if (i === startIdx)    total += win.end - startSec;
+    else if (i === essIdx) total += essSec - win.start;
+    else                   total += win.end - win.start;
+  }
+  return Math.max(0, total);
+}
+
+function remainingTaskDistKm(lastPos, nextTPidx, turnpoints) {
+  if (!lastPos || nextTPidx == null || nextTPidx >= turnpoints.length) return null;
+  var dist = 0, prevLat = lastPos.lat, prevLon = lastPos.lon;
+  for (var i = nextTPidx; i < turnpoints.length; i++) {
+    var tp = turnpoints[i];
+    dist += Math.max(0, haversineKm(prevLat, prevLon, tp.lat, tp.lon) - tp.radius / 1000);
+    prevLat = tp.lat; prevLon = tp.lon;
+  }
+  return dist;
+}
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function formatDate(dateStr) {
+  const y = dateStr.substring(0, 4), m = dateStr.substring(4, 6), d = dateStr.substring(6, 8);
+  const date = new Date(y + '-' + m + '-' + d);
+  return date.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+}
+
+// ── Pilot list ────────────────────────────────────────────────────────────────
+function renderPilotList() {
+  const pilotList = $('pilot-list');
+  pilotList.innerHTML = '';
+  const sorted = state.filteredPilots.slice().sort(function(a, b) { return (a.name || '').localeCompare(b.name || '', 'fr'); });
+  for (const p of sorted) {
+    const el = document.createElement('div');
+    el.className = 'pilot-item';
+    el.dataset.id = p.civlId;
+    el.innerHTML =
+      '<div class="pilot-item-name">' + esc(p.name) + '</div>' +
+      '<div class="pilot-item-meta">' +
+        '<span class="tag-air">✈ ' + esc(p.totalStats.airTimeHM) + '</span>' +
+        '<span class="tag-flights">' + p.totalStats.flights + ' vol' + (p.totalStats.flights > 1 ? 's' : '') + '</span>' +
+        '<span class="tag-alt">↑ ' + p.totalStats.dPlusHike + 'm</span>' +
+      '</div>';
+    if (p.civlId === state.selectedCivlId) el.classList.add('active');
+    el.addEventListener('click', () => selectPilot(p.civlId));
+    pilotList.appendChild(el);
+  }
+}
+
+$('search').addEventListener('input', function() {
+  const q = this.value.toLowerCase();
+  state.filteredPilots = state.pilots.filter(function(p) { return p.name.toLowerCase().includes(q); });
+  renderPilotList();
+});
+
+// ── Lazy track loader ─────────────────────────────────────────────────────────
+function loadPilotTracks(civlId) {
+  var key = '__BTF_TRACKS_' + civlId + '__';
+  if (window[key]) return Promise.resolve(window[key]);
+  return new Promise(function(resolve) {
+    var s = document.createElement('script');
+    s.src = 'data/' + civlId + '.js';
+    s.onload = function() { resolve(window[key] || []); };
+    s.onerror = function() { resolve([]); };
+    document.head.appendChild(s);
+  });
+}
+
+// ── Selection ─────────────────────────────────────────────────────────────────
+function selectPilot(civlId) {
+  state.selectedCivlId = civlId;
+  state.overviewMode = false;
+  document.querySelectorAll('.pilot-item').forEach(function(el) {
+    el.classList.toggle('active', el.dataset.id === civlId);
+  });
+  var pilot = state.pilots.find(function(p) { return p.civlId === civlId; });
+  showLoader();
+  loadPilotTracks(civlId).then(function(tracksByDay) {
+    for (var i = 0; i < pilot.days.length; i++) {
+      var d = pilot.days[i];
+      if (!d.track) {
+        var found = tracksByDay.find(function(td) { return td.dateStr === d.dateStr; });
+        if (found) d.track = found.track;
+      }
+    }
+    renderPilotDetail(pilot);
+  });
+}
+
+// ── Pilot detail ──────────────────────────────────────────────────────────────
+function renderPilotDetail(pilot) {
+  const content = $('content');
+  const s = pilot.totalStats;
+  const html = [];
+
+  html.push(
+    '<div class="pilot-header">' +
+      '<h2>' + esc(pilot.name) + '</h2>' +
+      '<div class="meta">CIVL #' + pilot.civlId + ' · Bib #' + esc(String(pilot.compId)) + ' · ' + s.daysCount + ' day' + (s.daysCount > 1 ? 's' : '') + '</div>' +
+    '</div>'
+  );
+
+  html.push('<div class="cards">');
+  const cards = [
+    { cls: 'fly',   val: s.airTimeHM,                                    lbl: 'Air time' },
+    { cls: 'fly',   val: s.flights + ' flight' + (s.flights>1?'s':''), lbl: 'Flights' },
+    { cls: 'fly',   val: round1(s.distFlyingKm) + ' km',               lbl: 'Flight distance' },
+    { cls: 'peak',  val: s.maxAlt + ' m',                              lbl: 'Max altitude' },
+    { cls: 'vario', val: '+' + s.bestVario + ' m/s',                   lbl: 'Best vario' },
+    { cls: 'hike',  val: s.hikeTimeHM,                                 lbl: 'Hiking time' },
+    { cls: 'hike',  val: round1(s.distHikingKm) + ' km',               lbl: 'Hiking distance' },
+    { cls: 'hike',  val: '+' + s.dPlusHike + ' m',                     lbl: 'D+ on foot' },
+  ];
+  for (const c of cards) {
+    html.push('<div class="stat-card ' + c.cls + '"><div class="stat-value">' + c.val + '</div><div class="stat-label">' + c.lbl + '</div></div>');
+  }
+  html.push('</div>');
+
+  html.push('<div class="section-title">Day-by-day breakdown</div>');
+
+  for (const day of pilot.days) {
+    const ds = day.stats;
+    const label = formatDate(day.dateStr);
+
+    html.push(
+      '<div class="chart-wrap">' +
+        '<div class="chart-title">' + label +
+          '<span class="zoom-hint" style="display:none;font-size:11px;font-weight:400;color:#94a3b8;margin-left:8px;cursor:pointer" title="Reset zoom">↺ reset</span>' +
+        '</div>' +
+        '<div class="phase-legend">' +
+          '<span><i class="dot dot-fly"></i>Flying</span>' +
+          '<span><i class="dot dot-hike"></i>Hiking</span>' +
+          '<span><i class="dot dot-ground"></i>Ground / waiting</span>' +
+          '<span><i class="vline vline-takeoff"></i>Takeoff</span>' +
+          '<span><i class="vline vline-landing"></i>Landing</span>' +
+        '</div>' +
+        '<canvas class="alt-chart" data-day="' + day.dateStr + '" data-civl="' + pilot.civlId + '"></canvas>' +
+        '<div class="chart-tooltip" style="position:fixed;display:none;background:#1e293b;color:#f1f5f9;padding:8px;border-radius:4px;font-size:12px;pointer-events:none;z-index:10;"></div>' +
+      '</div>'
+    );
+
+    html.push('<div class="cards" style="margin-bottom:24px">');
+    const daycards = [
+      { cls: 'fly',   val: ds.airTimeHM,                                    lbl: 'Air time' },
+      { cls: 'fly',   val: ds.flights + ' flight' + (ds.flights>1?'s':''), lbl: 'Flights' },
+      { cls: 'fly',   val: round1(ds.distFlyingKm) + ' km',               lbl: 'Flight dist.' },
+      { cls: 'peak',  val: ds.maxAlt + ' m',                              lbl: 'Max alt.' },
+      { cls: 'vario', val: '+' + ds.bestVario + ' m/s',                   lbl: 'Best vario' },
+      { cls: 'hike',  val: ds.hikeTimeHM,                                 lbl: 'Hiking' },
+      { cls: 'hike',  val: '+' + ds.dPlusHike + ' m',                     lbl: 'D+ on foot' },
+    ];
+    for (const c of daycards) {
+      html.push('<div class="stat-card ' + c.cls + '"><div class="stat-value">' + c.val + '</div><div class="stat-label">' + c.lbl + '</div></div>');
+    }
+    html.push('</div>');
+  }
+
+  content.innerHTML = html.join('');
+
+  for (const day of pilot.days) {
+    const canvas = content.querySelector('canvas[data-day="' + day.dateStr + '"][data-civl="' + pilot.civlId + '"]');
+    if (canvas) {
+      drawAltChart(canvas, day.track, day.segments, undefined, undefined, null, day.passages || []);
+      setupChartInteraction(canvas, day.track, day.segments, day.passages || []);
+    }
+  }
+}
+
+// ── Altitude profile chart ────────────────────────────────────────────────────
+function drawAltChart(canvas, track, segments, tMinView, tMaxView, hoverTime, passages) {
+  if (hoverTime === undefined) hoverTime = null;
+  if (!passages) passages = [];
+  if (!track || track.length < 2) return;
+
+  const DPR = window.devicePixelRatio || 1;
+  const W   = canvas.clientWidth  || 800;
+  const H   = canvas.clientHeight || 160;
+  canvas.width  = W * DPR;
+  canvas.height = H * DPR;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(DPR, DPR);
+
+  const PAD = { top: 10, right: 16, bottom: 28, left: 50 };
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top  - PAD.bottom;
+
+  const tMin = tMinView !== undefined ? tMinView : track[0].t;
+  const tMax = tMaxView !== undefined ? tMaxView : track[track.length - 1].t;
+
+  const visible = track.filter(function(p) { return p.t >= tMin && p.t <= tMax; });
+  const sample  = visible.length > 1 ? visible : track;
+  const altVals = sample.map(function(p) { return p.alt; });
+  const terVals = sample.filter(function(p) { return p.ter !== null; }).map(function(p) { return p.ter; });
+  const yMin = Math.max(0, (terVals.length ? Math.min.apply(null, terVals) : Math.min.apply(null, altVals)) - 50);
+  const yMax = Math.max.apply(null, altVals) + 80;
+
+  const xScale = function(t)   { return PAD.left + (t - tMin) / (tMax - tMin) * cW; };
+  const yScale = function(alt) { return PAD.top  + cH - (alt - yMin) / (yMax - yMin) * cH; };
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(PAD.left, PAD.top, cW, cH + 1);
+  ctx.clip();
+
+  const allTerPoints = track.filter(function(p) { return p.ter !== null; });
+  if (allTerPoints.length > 0) {
+    ctx.beginPath();
+    ctx.moveTo(xScale(tMin), H - PAD.bottom);
+    for (const p of allTerPoints) ctx.lineTo(xScale(p.t), yScale(p.ter));
+    ctx.lineTo(xScale(allTerPoints[allTerPoints.length - 1].t), H - PAD.bottom);
+    ctx.closePath();
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fill();
+  }
+
+  const COLORS = { flying: '#3b82f6', hiking: '#f97316', ground: '#94a3b8', unknown: '#94a3b8' };
+  let i = 0;
+  while (i < track.length) {
+    const phase = track[i].phase;
+    ctx.beginPath();
+    ctx.moveTo(xScale(track[i].t), yScale(track[i].alt));
+    let j = i;
+    while (j < track.length && track[j].phase === phase) {
+      ctx.lineTo(xScale(track[j].t), yScale(track[j].alt));
+      j++;
+    }
+    if (j < track.length) ctx.lineTo(xScale(track[j].t), yScale(track[j].alt));
+    ctx.strokeStyle = COLORS[phase] || COLORS.unknown;
+    ctx.lineWidth   = phase === 'flying' ? 2 : 1.5;
+    ctx.lineJoin    = 'round';
+    ctx.stroke();
+    i = j;
+  }
+
+  ctx.restore();
+
+  if (hoverTime !== null && hoverTime >= tMin && hoverTime <= tMax) {
+    let closest = null;
+    let minDiff = Infinity;
+    for (const p of track) {
+      const diff = Math.abs(p.t - hoverTime);
+      if (diff < minDiff) { minDiff = diff; closest = p; }
+    }
+    if (closest) {
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.arc(xScale(closest.t), yScale(closest.alt), 4, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  const yTop    = PAD.top;
+  const yBottom = H - PAD.bottom;
+
+  if (passages.length > 0) {
+    const TP_COLORS = { SSS: '#22c55e', ESS: '#a855f7', GOAL: '#ef4444' };
+    ctx.font      = '9px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([2, 2]);
+    for (var pi = 0; pi < passages.length; pi++) {
+      var p = passages[pi];
+      if (!['SSS', 'ESS', 'GOAL'].includes(p.type)) continue;
+      if (p.timeSec < tMin || p.timeSec > tMax) continue;
+      var x = xScale(p.timeSec);
+      var color = TP_COLORS[p.type] || '#f59e0b';
+      ctx.strokeStyle = color;
+      ctx.fillStyle   = color;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath(); ctx.moveTo(x, yTop + 14); ctx.lineTo(x, yBottom); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillText(p.type, x, yTop + 12);
+    }
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.font      = '10px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 3]);
+
+  function drawVLine(tSec, color) {
+    if (tSec < tMin || tSec > tMax) return;
+    const x = xScale(tSec);
+    ctx.strokeStyle = color;
+    ctx.fillStyle   = color;
+    ctx.beginPath(); ctx.moveTo(x, yTop + 2); ctx.lineTo(x, yBottom); ctx.stroke();
+    const _t0 = (tSec + UTC_OFFSET_S) % 86400;
+    const hh = Math.floor(_t0 / 3600), mm = Math.floor((_t0 % 3600) / 60);
+    ctx.fillText(String(hh).padStart(2,'0') + ':' + String(mm).padStart(2,'0'), x, yBottom - 3);
+  }
+
+  if (segments) {
+    for (const seg of segments) {
+      if (seg.phase !== 'flying') continue;
+      drawVLine(seg.startSec, '#ef4444');
+      drawVLine(seg.endSec,   '#6366f1');
+    }
+  }
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '10px -apple-system, sans-serif';
+  ctx.textAlign = 'right';
+  const tickCount = 4;
+  for (let ti = 0; ti <= tickCount; ti++) {
+    const alt = yMin + (yMax - yMin) * (ti / tickCount);
+    const y   = yScale(alt);
+    ctx.fillText(Math.round(alt) + 'm', PAD.left - 5, y + 3);
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(PAD.left, y);
+    ctx.lineTo(W - PAD.right, y);
+    ctx.stroke();
+  }
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#94a3b8';
+  const labelCount = Math.min(6, Math.floor(cW / 70));
+  for (let li = 0; li <= labelCount; li++) {
+    const t = tMin + (tMax - tMin) * (li / labelCount);
+    const x = xScale(t);
+    const _t1 = (t + UTC_OFFSET_S) % 86400;
+    const hh = Math.floor(_t1 / 3600), mm = Math.floor((_t1 % 3600) / 60);
+    ctx.fillText(String(hh).padStart(2,'0') + ':' + String(mm).padStart(2,'0'), x, H - PAD.bottom + 14);
+  }
+}
+
+// ── Chart zoom & pan interaction ──────────────────────────────────────────────
+function setupChartInteraction(canvas, track, segments, passages) {
+  if (!passages) passages = [];
+  if (!track || track.length < 2) return;
+  const tMinFull = track[0].t;
+  const tMaxFull = track[track.length - 1].t;
+  const PAD_LEFT = 50, PAD_RIGHT = 16;
+
+  chartZoom.set(canvas, { tMinView: tMinFull, tMaxView: tMaxFull, tMinFull: tMinFull, tMaxFull: tMaxFull, hoverTime: null, passages: passages });
+  canvas.style.cursor = 'crosshair';
+
+  const hint    = canvas.closest('.chart-wrap') && canvas.closest('.chart-wrap').querySelector('.zoom-hint');
+  const tooltip = canvas.closest('.chart-wrap') && canvas.closest('.chart-wrap').querySelector('.chart-tooltip');
+
+  function redraw() {
+    const z = chartZoom.get(canvas);
+    drawAltChart(canvas, track, segments, z.tMinView, z.tMaxView, z.hoverTime, z.passages || []);
+    if (hint) hint.style.display = (z.tMinView > z.tMinFull || z.tMaxView < z.tMaxFull) ? '' : 'none';
+  }
+
+  canvas.addEventListener('wheel', function(e) {
+    e.preventDefault();
+    const z = chartZoom.get(canvas);
+    const cW = canvas.clientWidth - PAD_LEFT - PAD_RIGHT;
+    const frac = Math.max(0, Math.min(1, (e.offsetX - PAD_LEFT) / cW));
+    const tCursor = z.tMinView + frac * (z.tMaxView - z.tMinView);
+    const factor = e.deltaY < 0 ? 0.7 : 1 / 0.7;
+    let newMin = tCursor - (tCursor - z.tMinView) * factor;
+    let newMax = tCursor + (z.tMaxView - tCursor) * factor;
+    newMin = Math.max(newMin, z.tMinFull);
+    newMax = Math.min(newMax, z.tMaxFull);
+    if (newMax - newMin < 60) return;
+    chartZoom.set(canvas, Object.assign({}, z, { tMinView: newMin, tMaxView: newMax, hoverTime: null }));
+    if (tooltip) tooltip.style.display = 'none';
+    redraw();
+  }, { passive: false });
+
+  let drag = null;
+  canvas.addEventListener('mousedown', function(e) {
+    const z = chartZoom.get(canvas);
+    drag = { clientX: e.clientX, tMinView: z.tMinView, tMaxView: z.tMaxView };
+    canvas.style.cursor = 'grabbing';
+  });
+
+  canvas.addEventListener('mousemove', function(e) {
+    if (drag) {
+      const z = chartZoom.get(canvas);
+      const cW = canvas.clientWidth - PAD_LEFT - PAD_RIGHT;
+      const range = drag.tMaxView - drag.tMinView;
+      const dt = -(e.clientX - drag.clientX) / cW * range;
+      let newMin = drag.tMinView + dt;
+      let newMax = drag.tMaxView + dt;
+      if (newMin < z.tMinFull) { newMin = z.tMinFull; newMax = newMin + range; }
+      if (newMax > z.tMaxFull) { newMax = z.tMaxFull; newMin = newMax - range; }
+      chartZoom.set(canvas, Object.assign({}, z, { tMinView: newMin, tMaxView: newMax }));
+      redraw();
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const z = chartZoom.get(canvas);
+    const cW = canvas.clientWidth - PAD_LEFT - PAD_RIGHT;
+    if (x < PAD_LEFT || x > canvas.clientWidth - PAD_RIGHT) {
+      chartZoom.set(canvas, Object.assign({}, z, { hoverTime: null }));
+      if (tooltip) tooltip.style.display = 'none';
+      redraw();
+      return;
+    }
+    const frac = (x - PAD_LEFT) / cW;
+    const hoverTime = z.tMinView + frac * (z.tMaxView - z.tMinView);
+    chartZoom.set(canvas, Object.assign({}, z, { hoverTime: hoverTime }));
+    redraw();
+    if (tooltip) {
+      let closest = null;
+      let minDiff = Infinity;
+      for (const p of track) {
+        const diff = Math.abs(p.t - hoverTime);
+        if (diff < minDiff) { minDiff = diff; closest = p; }
+      }
+      if (closest) {
+        const _t2 = (closest.t + UTC_OFFSET_S) % 86400;
+        const hh = Math.floor(_t2 / 3600);
+        const mm = Math.floor((_t2 % 3600) / 60);
+        const ss = Math.floor(_t2 % 60);
+        const timeStr = String(hh).padStart(2,'0') + ':' + String(mm).padStart(2,'0') + ':' + String(ss).padStart(2,'0');
+        const speedStr = closest.speed ? Math.round(closest.speed * 10) / 10 + ' km/h' : 'N/A';
+        const aglStr   = closest.agl  !== null ? Math.round(closest.agl) + ' m'  : 'N/A';
+        const altStr   = closest.alt  !== null ? Math.round(closest.alt) + ' m'  : 'N/A';
+        tooltip.innerHTML = timeStr + '<br>Vitesse: ' + speedStr + '<br>AGL: ' + aglStr + '<br>ALT: ' + altStr;
+        tooltip.style.left    = (e.clientX + 10) + 'px';
+        tooltip.style.top     = (e.clientY - 10) + 'px';
+        tooltip.style.display = 'block';
+      }
+    }
+  });
+
+  function endDrag() { drag = null; canvas.style.cursor = 'crosshair'; }
+  canvas.addEventListener('mouseup', endDrag);
+  canvas.addEventListener('mouseleave', function() {
+    endDrag();
+    const z = chartZoom.get(canvas);
+    chartZoom.set(canvas, Object.assign({}, z, { hoverTime: null }));
+    if (tooltip) tooltip.style.display = 'none';
+    redraw();
+  });
+
+  canvas.addEventListener('dblclick', function() {
+    const z = chartZoom.get(canvas);
+    chartZoom.set(canvas, Object.assign({}, z, { tMinView: z.tMinFull, tMaxView: z.tMaxFull, hoverTime: null }));
+    if (tooltip) tooltip.style.display = 'none';
+    redraw();
+  });
+
+  if (hint) hint.addEventListener('click', function() {
+    const z = chartZoom.get(canvas);
+    chartZoom.set(canvas, Object.assign({}, z, { tMinView: z.tMinFull, tMaxView: z.tMaxFull }));
+    redraw();
+  });
+}
+
+// ── Overview table ────────────────────────────────────────────────────────────
+function showOverview() {
+  const content = $('content');
+  state.overviewMode = true;
+  state.selectedCivlId = null;
+  document.querySelectorAll('.pilot-item').forEach(function(el) { el.classList.remove('active'); });
+
+  const sorted = state.pilots.slice().sort(function(a, b) {
+    if (state.sortCol === 'name') {
+      return state.sortAsc
+        ? (a.name || '').localeCompare(b.name || '', 'fr')
+        : (b.name || '').localeCompare(a.name || '', 'fr');
+    }
+    const va = a.totalStats[state.sortCol] !== undefined ? a.totalStats[state.sortCol] : 0;
+    const vb = b.totalStats[state.sortCol] !== undefined ? b.totalStats[state.sortCol] : 0;
+    return state.sortAsc ? va - vb : vb - va;
+  });
+
+  const rowsHtml = sorted.map(function(p, i) {
+    const s = p.totalStats;
+    const cells = OV_COLS.map(function(col) {
+      let val;
+      if (col.key === 'rank')          val = i + 1;
+      else if (col.key === 'name')     val = '<a class="pilot-link" data-id="' + p.civlId + '">' + esc(p.name) + '</a>';
+      else if (col.key === 'compId')   val = p.compId;
+      else if (col.key === 'bestVario')val = '+' + s.bestVario + ' m/s';
+      else if (col.key === 'maxAlt')   val = s.maxAlt + ' m';
+      else if (col.key === 'dPlusHike')val = '+' + s.dPlusHike + ' m';
+      else if (col.key === 'distFlyingKm' || col.key === 'distHikingKm') val = round1(s[col.key]) + ' km';
+      else val = s[col.key] !== undefined ? s[col.key] : '';
+      return '<td class="' + col.cls + '">' + val + '</td>';
+    }).join('');
+    return '<tr>' + cells + '</tr>';
+  }).join('');
+
+  const headCells = OV_COLS.map(function(col) {
+    const active = (col.sort === state.sortCol) ? ' sorted' : '';
+    const icon   = col.sort ? '<span class="sort-icon">' + (state.sortAsc ? '▲' : '▼') + '</span>' : '';
+    return '<th class="' + active + '" data-sort="' + (col.sort || '') + '">' + col.label + icon + '</th>';
+  }).join('');
+
+  content.innerHTML =
+    '<div id="overview-wrap">' +
+      '<div class="table-wrap">' +
+        '<table>' +
+          '<thead><tr>' + headCells + '</tr></thead>' +
+          '<tbody>' + rowsHtml + '</tbody>' +
+        '</table>' +
+      '</div>' +
+    '</div>';
+
+  content.querySelectorAll('th[data-sort]').forEach(function(th) {
+    if (!th.dataset.sort) return;
+    th.addEventListener('click', function() {
+      if (state.sortCol === th.dataset.sort) state.sortAsc = !state.sortAsc;
+      else { state.sortCol = th.dataset.sort; state.sortAsc = false; }
+      showOverview();
+    });
+  });
+
+  content.querySelectorAll('.pilot-link').forEach(function(a) {
+    a.style.cssText = 'color:var(--accent);cursor:pointer;text-decoration:none;';
+    a.addEventListener('click', function() { selectPilot(a.dataset.id); });
+  });
+}
+
+// ── Classement ────────────────────────────────────────────────────────────────
+function showClassement() {
+  var content = $('content');
+  state.classementMode = true;
+  state.overviewMode = false;
+  state.selectedCivlId = null;
+  document.querySelectorAll('.pilot-item').forEach(function(el) { el.classList.remove('active'); });
+
+  var ranked = [], unranked = [];
+  for (var pi = 0; pi < state.pilots.length; pi++) {
+    var pilot = state.pilots[pi];
+    var goalPassage = null, essPassage = null, goalDay = null;
+    for (var di = 0; di < pilot.days.length; di++) {
+      var day = pilot.days[di];
+      if (day.passages) {
+        for (var gi = 0; gi < day.passages.length; gi++) {
+          if (day.passages[gi].type === 'GOAL') { goalPassage = day.passages[gi]; goalDay = day; break; }
+        }
+        if (goalPassage) {
+          for (var ei = 0; ei < day.passages.length; ei++) {
+            if (day.passages[ei].type === 'ESS') { essPassage = day.passages[ei]; break; }
+          }
+        }
+      }
+      if (goalPassage) break;
+    }
+    if (goalPassage) {
+      ranked.push({ pilot: pilot, goalPassage: goalPassage, essPassage: essPassage, goalDay: goalDay });
+    } else {
+      unranked.push({ pilot: pilot, lastDay: pilot.days[pilot.days.length - 1] });
+    }
+  }
+
+  var dayWin = state.dayWindows || {};
+  for (var di2 = 0; di2 < ranked.length; di2++) {
+    var rp = ranked[di2].essPassage || ranked[di2].goalPassage;
+    ranked[di2].durSec = calcRaceDurationSec(ranked[di2].pilot, rp, ranked[di2].goalDay, dayWin);
+  }
+
+  ranked.sort(function(a, b) {
+    var dc = a.goalDay.dateStr.localeCompare(b.goalDay.dateStr);
+    if (dc !== 0) return dc;
+    if (a.durSec !== null && b.durSec !== null) return a.durSec - b.durSec;
+    return (a.essPassage || a.goalPassage).timeSec - (b.essPassage || b.goalPassage).timeSec;
+  });
+
+  var tieWin = state.tieWindowS;
+  var rankCounter = 1;
+  var ri2 = 0;
+  while (ri2 < ranked.length) {
+    var leader = ranked[ri2], rj = ri2 + 1;
+    var leaderVal = leader.durSec !== null ? leader.durSec : (leader.essPassage || leader.goalPassage).timeSec;
+    while (rj < ranked.length &&
+           ranked[rj].goalDay.dateStr === leader.goalDay.dateStr &&
+           (ranked[rj].durSec !== null ? ranked[rj].durSec : (ranked[rj].essPassage || ranked[rj].goalPassage).timeSec) - leaderVal <= tieWin) rj++;
+    var tied = rj - ri2 > 1;
+    for (var rk = ri2; rk < rj; rk++) { ranked[rk].rank = rankCounter; ranked[rk].tied = tied; }
+    rankCounter += rj - ri2;
+    ri2 = rj;
+  }
+
+  if (state.taskTurnpoints) {
+    for (var ui = 0; ui < unranked.length; ui++) {
+      var lp = unranked[ui].lastDay && unranked[ui].lastDay.lastPos;
+      unranked[ui].distKm = lp ? remainingTaskDistKm(lp, unranked[ui].pilot.nextTP, state.taskTurnpoints) : null;
+    }
+    unranked.sort(function(a, b) { return (a.distKm !== null ? a.distKm : Infinity) - (b.distKm !== null ? b.distKm : Infinity); });
+  } else if (state.goalCoords) {
+    for (var ui = 0; ui < unranked.length; ui++) {
+      var lp = unranked[ui].lastDay && unranked[ui].lastDay.lastPos;
+      unranked[ui].distKm = lp ? haversineKm(lp.lat, lp.lon, state.goalCoords.lat, state.goalCoords.lon) : null;
+    }
+    unranked.sort(function(a, b) { return (a.distKm !== null ? a.distKm : Infinity) - (b.distKm !== null ? b.distKm : Infinity); });
+  }
+
+  function fmtTime(s) {
+    var _s = (s + UTC_OFFSET_S) % 86400;
+    var hh = Math.floor(_s/3600), mm = Math.floor((_s%3600)/60), ss = Math.floor(_s%60);
+    return String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0');
+  }
+
+  var rank = rankCounter, html = ['<div id="overview-wrap">'];
+
+  if (ranked.length) {
+    html.push('<div class="section-title">Goal finishers (' + ranked.length + ')</div>');
+    html.push('<div class="table-wrap"><table><thead><tr><th>#</th><th>Pilot</th><th>Bib</th><th>Day</th><th>Time</th><th>ESS time</th></tr></thead><tbody>');
+    for (var ri = 0; ri < ranked.length; ri++) {
+      var r = ranked[ri];
+      var rankPassage = r.essPassage || r.goalPassage;
+      var durCell = r.durSec !== null ? fmtTime(r.durSec) : '—';
+      html.push('<tr><td>' + (r.tied ? '=' : '') + r.rank + '</td>' +
+        '<td><a class="pilot-link" data-id="' + r.pilot.civlId + '" style="color:var(--accent);cursor:pointer;text-decoration:none;">' + esc(r.pilot.name) + '</a></td>' +
+        '<td>' + esc(String(r.pilot.compId)) + '</td>' +
+        '<td>' + formatDate(r.goalDay.dateStr) + '</td>' +
+        '<td class="td-fly">' + durCell + '</td>' +
+        '<td class="td-fly">' + fmtTime(rankPassage.timeSec) + '</td></tr>');
+    }
+    html.push('</tbody></table></div>');
+  }
+
+  if (unranked.length) {
+    var hasTask = !!(state.taskTurnpoints || state.goalCoords);
+    var distHead = hasTask ? '<th>Dist. to goal</th>' : '';
+    html.push('<div class="section-title" style="margin-top:24px">Did not finish (' + unranked.length + ')</div>');
+    html.push('<div class="table-wrap"><table><thead><tr><th>#</th><th>Pilot</th><th>Bib</th>' + distHead + '</tr></thead><tbody>');
+    for (var un = 0; un < unranked.length; un++) {
+      var u = unranked[un];
+      var distCell = hasTask ? '<td>' + (u.distKm !== null ? round1(u.distKm) + ' km' : '—') + '</td>' : '';
+      html.push('<tr><td>' + (rank++) + '</td>' +
+        '<td><a class="pilot-link" data-id="' + u.pilot.civlId + '" style="color:var(--accent);cursor:pointer;text-decoration:none;">' + esc(u.pilot.name) + '</a></td>' +
+        '<td>' + esc(String(u.pilot.compId)) + '</td>' + distCell + '</tr>');
+    }
+    html.push('</tbody></table></div>');
+  }
+
+  html.push('</div>');
+  content.innerHTML = html.join('');
+
+  content.querySelectorAll('.pilot-link').forEach(function(a) {
+    a.addEventListener('click', function() { selectPilot(a.dataset.id); });
+  });
+}
+
+// ── Loader ────────────────────────────────────────────────────────────────────
+function showLoader(msg) {
+  if (!msg) msg = 'Chargement…';
+  $('content').innerHTML = '<div class="loader-wrap"><div class="spinner"></div><span>' + msg + '</span></div>';
+}
+
+// ── Event wiring ──────────────────────────────────────────────────────────────
+$('btn-overview').addEventListener('click', showOverview);
+$('btn-classement').addEventListener('click', showClassement);
+
+window.addEventListener('resize', function() {
+  clearTimeout(window._resizeTimer);
+  window._resizeTimer = setTimeout(function() {
+    if (!state.overviewMode && state.selectedCivlId) {
+      const pilot = state.pilots.find(function(p) { return p.civlId === state.selectedCivlId; });
+      if (pilot) renderPilotDetail(pilot);
+    }
+  }, 200);
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+(function() {
+  var meta = window.__BTF_META__ || {};
+  var pilots = window.__BTF_PILOTS__ || [];
+  state.pilots = pilots;
+  state.filteredPilots = pilots.slice();
+  state.goalCoords = meta.goalCoords || null;
+  state.taskTurnpoints = meta.taskTurnpoints || null;
+  state.dayWindows = meta.dayWindows || {};
+  state.tieWindowS = meta.tieWindowS ?? 10;
+  renderPilotList();
+  showOverview();
+})();
+
+</script>
+</body>
+</html>
